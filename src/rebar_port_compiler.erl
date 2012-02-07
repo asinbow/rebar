@@ -39,8 +39,9 @@
 %% Supported configuration variables:
 %%
 %% * port_specs - Erlang list of tuples of the forms
-%%                {arch_regex(), "priv/foo.so", ["c_src/foo.c"]}
-%%                {"priv/foo", ["c_src/foo.c"]}
+%%                {ArchRegex, TargetFile, Sources, Options}
+%%                {ArchRegex, TargetFile, Sources}
+%%                {TargetFile, Sources}
 %%
 %% * port_envs - Erlang list of key/value pairs which will control
 %%               the environment when running the compiler and linker.
@@ -96,7 +97,7 @@ compile(Config, AppFile) ->
         [] ->
             ok;
         _ ->
-            Env = setup_env(Config),
+            Env = rebar_config:get_env(Config, ?MODULE),
 
             %% Compile each of the sources
             {NewBins, ExistingBins} = compile_each(SourceFiles, Config, Env,
@@ -106,9 +107,7 @@ compile(Config, AppFile) ->
             %% target directory exists
             Specs = port_specs(Config, AppFile, NewBins ++ ExistingBins),
             ?INFO("Using specs ~p\n", [Specs]),
-            lists:foreach(fun({_, Target,_}) ->
-                                  ok = filelib:ensure_dir(Target);
-                             ({Target, _}) ->
+            lists:foreach(fun({Target, _}) ->
                                   ok = filelib:ensure_dir(Target)
                           end, Specs),
 
@@ -140,28 +139,32 @@ clean(Config, AppFile) ->
     rebar_file_utils:delete_each([source_to_bin(S) || S <- Sources]),
 
     %% Delete the target file
-    ExtractTarget = fun({_, Target, _}) ->
+    ExtractTarget = fun({_, Target, _, _}) ->
+                            Target;
+                       ({_, Target, _}) ->
                             Target;
                        ({Target, _}) ->
                             Target
                     end,
-    rebar_file_utils:delete_each([ExtractTarget(S)
-                                  || S <- port_specs(Config, AppFile,
-                                                     expand_objects(Sources))]).
+    PortSpecs = port_specs(Config, AppFile, expand_objects(Sources)),
+    rebar_file_utils:delete_each([ExtractTarget(S) || S <- PortSpecs]).
 
 setup_env(Config) ->
+    setup_env(Config, []).
+
+%% ===================================================================
+%% Internal functions
+%% ===================================================================
+
+setup_env(Config, ExtraEnv) ->
     %% Extract environment values from the config (if specified) and
     %% merge with the default for this operating system. This enables
     %% max flexibility for users.
     DefaultEnvs  = filter_envs(default_env(), []),
     PortEnvs = port_envs(Config),
-    OverrideEnvs = global_defines() ++ filter_envs(PortEnvs, []),
+    OverrideEnvs = global_defines() ++ ExtraEnv ++ filter_envs(PortEnvs, []),
     RawEnv = apply_defaults(os_env(), DefaultEnvs) ++ OverrideEnvs,
     expand_vars_loop(merge_each_var(RawEnv, [])).
-
-%% ===================================================================
-%% Internal functions
-%% ===================================================================
 
 global_defines() ->
     Defines = rebar_config:get_global(defines, []),
@@ -175,22 +178,34 @@ get_sources(Config) ->
             expand_sources(rebar_config:get_list(Config, port_sources,
                                                  ["c_src/*.c"]), []);
         PortSpecs ->
-            expand_port_specs(PortSpecs)
+            expand_port_specs(Config, PortSpecs)
     end.
 
-expand_port_specs(Specs) ->
-    lists:flatmap(fun({_, Target, FileSpecs}) ->
-                          expand_file_specs(Target, FileSpecs);
+expand_port_specs(Config, Specs) ->
+    lists:flatmap(fun({_, Target, FileSpecs, Opts}) ->
+                          expand_file_specs(Target, FileSpecs,
+                                            expand_opts(Config, Opts));
+                     ({_, Target, FileSpecs}) ->
+                          expand_file_specs(Target, FileSpecs, []);
                      ({Target, FileSpecs}) ->
-                          expand_file_specs(Target, FileSpecs)
+                          expand_file_specs(Target, FileSpecs, [])
                   end, filter_port_specs(Specs)).
 
-expand_file_specs(Target, FileSpecs) ->
+expand_opts(Config, Opts) ->
+    lists:map(fun({envs, Env}) ->
+                      {envs, setup_env(Config, filter_envs(Env, []))};
+                 (Opt) ->
+                      Opt
+              end, Opts).
+
+expand_file_specs(Target, FileSpecs, Opts) ->
     Sources = lists:flatmap(fun filelib:wildcard/1, FileSpecs),
-    [{Target, Src} || Src <- Sources].
+    [{Target, Src, Opts} || Src <- Sources].
 
 filter_port_specs(Specs) ->
-    lists:filter(fun({ArchRegex, _, _}) ->
+    lists:filter(fun({ArchRegex, _, _, _}) ->
+                         rebar_utils:is_arch(ArchRegex);
+                    ({ArchRegex, _, _}) ->
                          rebar_utils:is_arch(ArchRegex);
                     ({_, _}) ->
                          true
@@ -215,6 +230,8 @@ expand_sources([Spec | Rest], Acc) ->
 expand_objects(Sources) ->
     [expand_object(".o", Src) || Src <- Sources].
 
+expand_object(Ext, {_Target, Source, _Opts}) ->
+    expand_object(Ext, Source);
 expand_object(Ext, {_Target, Source}) ->
     expand_object(Ext, Source);
 expand_object(Ext, Source) ->
@@ -222,9 +239,10 @@ expand_object(Ext, Source) ->
 
 compile_each([], _Config, _Env, NewBins, ExistingBins) ->
     {lists:reverse(NewBins), lists:reverse(ExistingBins)};
-compile_each([RawSource | Rest], Config, Env, NewBins, ExistingBins) ->
+compile_each([RawSource | Rest], Config, RawEnv, NewBins, ExistingBins) ->
     %% TODO: DEPRECATED: remove
-    {Type, Source} = source_type(RawSource),
+    {Type, Source, Opts} = source_type(RawSource),
+    Env = proplists:get_value(envs, Opts, RawEnv),
     Ext = filename:extension(Source),
     Bin = filename:rootname(Source, Ext) ++ ".o",
     case needs_compile(Source, Bin) of
@@ -239,8 +257,8 @@ compile_each([RawSource | Rest], Config, Env, NewBins, ExistingBins) ->
             compile_each(Rest, Config, Env, NewBins, [Bin | ExistingBins])
     end.
 
-source_type({Target, Source}) -> {target_type(Target), Source};
-source_type(Source)           -> {drv, Source}.
+source_type({Target, Source, Opts}) -> {target_type(Target), Source, Opts};
+source_type(Source)                 -> {drv, Source, []}.
 
 needs_compile(Source, Bin) ->
     %% TODO: Generate depends using gcc -MM so we can also
@@ -520,6 +538,8 @@ default_env() ->
      {"darwin11.*-32", "LDFLAGS", "-arch i386 $LDFLAGS"}
     ].
 
+source_to_bin({_Target, Source, _Opts}) ->
+    source_to_bin(Source);
 source_to_bin({_Target, Source}) ->
     source_to_bin(Source);
 source_to_bin(Source) ->
