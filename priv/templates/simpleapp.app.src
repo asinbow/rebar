@@ -1,3 +1,5 @@
+%% -*-Erlang-*-
+%% vim: set filetype=erlang:
 {application, {{appid}},
  [
   {description, ""},

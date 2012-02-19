@@ -1,2 +1,4 @@
+%% -*-Erlang-*-
+%% vim: set filetype=erlang:
 {variables, [{fsmid, "myfsm"}]}.
 {template, "simplefsm.erl", "src/{{fsmid}}.erl"}.
