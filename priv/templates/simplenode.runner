@@ -67,8 +67,9 @@ NODETOOL="$ERTS_PATH/escript $ERTS_PATH/nodetool $NAME_ARG $COOKIE_ARG"
 case "$1" in
     start)
         # Make sure there is not already a node running
-        RES=`$NODETOOL ping`
-        if [ "$RES" = "pong" ]; then
+        $NODETOOL ping
+        ES=$?
+        if [ "$ES" -eq 0 ]; then
             echo "Node is already running!"
             exit 1
         fi
@@ -137,7 +138,7 @@ case "$1" in
 
     attach)
         # Make sure a node IS running
-        RES=`$NODETOOL ping`
+        $NODETOOL ping
         ES=$?
         if [ "$ES" -ne 0 ]; then
             echo "Node is not running!"
